@@ -3,5 +3,6 @@
   "name": "Agent Usage",
   "description": "Tracks agentic AI usage (cost and tokens) from opencode, Claude Code, and Codex on your machine",
   "shell-version": ["50"],
-  "version-name": "1.1"
+  "version-name": "1.1",
+  "url": "https://github.com/hangodek/gnome-agent-usage"
 }
