@@ -21,6 +21,8 @@ function formatTokens(n) {
 }
 
 function formatMoney(cost) {
+    if (cost > 0 && cost < 0.01)
+        return `$${cost.toFixed(4)}`;
     return `$${cost.toFixed(2)}`;
 }
 
@@ -116,8 +118,9 @@ class AgentUsageButton extends PanelMenu.Button {
     }
 
     _render(data) {
-        const {today, week, month, total, per_model, last7, active, sources} = data;
+        const {today, week, month, total, per_model, last7, active, sources, errors} = data;
         const activeList = Array.isArray(active) ? active : active ? [active] : [];
+        const errorList = Array.isArray(errors) ? errors : [];
 
         this._label.text = today.cost > 0
             ? formatMoney(today.cost)
@@ -166,6 +169,14 @@ class AgentUsageButton extends PanelMenu.Button {
             for (const d of last7) {
                 this._content.addMenuItem(this._row(
                     `  ${formatDay(d.day)}  ${formatMoney(d.cost)} · ${formatTokens(d.tokens)} tok`));
+            }
+        }
+
+        if (errorList.length > 0) {
+            this._content.addMenuItem(this._separator());
+            for (const e of errorList) {
+                const message = String(e.error || 'unknown error').slice(0, 60);
+                this._content.addMenuItem(this._row(`⚠ ${e.source}: ${message}`));
             }
         }
 

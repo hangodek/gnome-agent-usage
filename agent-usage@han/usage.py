@@ -134,9 +134,11 @@ def claude_rows():
                 usage = message.get("usage")
                 if not usage:
                     continue
-                cost = usage.get("costUSD")
+                # Real transcripts carry costUSD at the event top level
+                # (e.g. {"timestamp":..., "message":{...,"usage":{...}}, "costUSD":0.001})
+                cost = ev.get("costUSD")
                 if cost is None:
-                    cost = usage.get("total_costUSD", 0.0)
+                    cost = usage.get("costUSD", 0.0)
                 rows.append({
                     "source": "claude",
                     "ts": _ts_ms(ev.get("timestamp")),
@@ -167,20 +169,45 @@ def codex_rows():
                     ev = json.loads(line)
                 except ValueError:
                     continue
-                message = ev.get("message") or {}
-                usage = message.get("usage")
-                if not usage:
+                ts = _ts_ms(ev.get("timestamp"))
+                event_type = ev.get("type")
+                if event_type == "token_count":
+                    # Current format: per-request usage in payload.info
+                    # (e.g. {"type":"token_count","timestamp":...,"payload":
+                    #  {"info":{"model":...,"input_tokens":N,"output_tokens":N,
+                    #   "cache_read_input_tokens":N},"total":{...}}})
+                    info = (ev.get("payload") or {}).get("info") or {}
+                    tin = info.get("input_tokens", 0)
+                    tout = info.get("output_tokens", 0) \
+                        + info.get("reasoning_output_tokens", 0)
+                    if tin == 0 and tout == 0:
+                        continue
+                    tcache = info.get("cache_read_input_tokens", 0) \
+                        or info.get("cached_input_tokens", 0)
+                    model = info.get("model") or info.get("model_name") or "unknown"
+                elif event_type == "message":
+                    # Legacy format: usage on the assistant message
+                    # (e.g. {"type":"message","message":{...,"usage":
+                    #  {"prompt_tokens":N,"completion_tokens":N,"model":M}}})
+                    usage = (ev.get("message") or {}).get("usage")
+                    if not usage:
+                        continue
+                    tin = usage.get("prompt_tokens", 0)
+                    tout = usage.get("completion_tokens", 0)
+                    if tin == 0 and tout == 0:
+                        continue
+                    tcache = usage.get("cache_read_input_tokens", 0)
+                    model = usage.get("model") \
+                        or (ev.get("message") or {}).get("model") or "unknown"
+                else:
                     continue
-                tin = usage.get("prompt_tokens", 0)
-                tout = usage.get("completion_tokens", 0)
-                model = usage.get("model") or message.get("model") or "unknown"
                 rows.append({
                     "source": "codex",
-                    "ts": _ts_ms(ev.get("timestamp")),
+                    "ts": ts,
                     "cost": codex_cost(model, tin, tout),
                     "tin": tin,
                     "tout": tout,
-                    "tcache": 0,
+                    "tcache": tcache,
                     "model": model,
                 })
     return rows
