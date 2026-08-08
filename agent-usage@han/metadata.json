@@ -1,7 +1,7 @@
 {
   "uuid": "agent-usage@han",
   "name": "Agent Usage",
-  "description": "Tracks agentic AI usage (cost and tokens) from opencode's local database",
+  "description": "Tracks agentic AI usage (cost and tokens) from opencode, Claude Code, and Codex on your machine",
   "shell-version": ["50"],
-  "version-name": "1.0"
+  "version-name": "1.1"
 }

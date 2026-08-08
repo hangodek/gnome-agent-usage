@@ -116,7 +116,8 @@ class AgentUsageButton extends PanelMenu.Button {
     }
 
     _render(data) {
-        const {today, week, month, total, per_model, last7, active} = data;
+        const {today, week, month, total, per_model, last7, active, sources} = data;
+        const activeList = Array.isArray(active) ? active : active ? [active] : [];
 
         this._label.text = today.cost > 0
             ? formatMoney(today.cost)
@@ -135,7 +136,9 @@ class AgentUsageButton extends PanelMenu.Button {
 
         this._content.addMenuItem(this._separator());
         this._content.addMenuItem(this._row(
-            active ? `● ${active} — active now` : 'Idle — no agent session running'));
+            activeList.length > 0
+                ? `● ${activeList.join(', ')} — active now`
+                : 'Idle — no agent session running'));
 
         if (per_model.length > 0) {
             this._content.addMenuItem(this._separator());
@@ -144,6 +147,16 @@ class AgentUsageButton extends PanelMenu.Button {
                 const amount = m.cost > 0 ? formatMoney(m.cost) : `${formatTokens(m.tokens)} tok`;
                 this._content.addMenuItem(this._row(
                     `  ${m.model}  ${amount} · ${m.sessions} session${m.sessions === 1 ? '' : 's'}`));
+            }
+        }
+
+        if (sources.length > 0) {
+            this._content.addMenuItem(this._separator());
+            this._content.addMenuItem(this._row('Today by source', true));
+            for (const s of sources) {
+                const amount = s.cost > 0 ? formatMoney(s.cost) : `${formatTokens(s.tokens)} tok`;
+                this._content.addMenuItem(this._row(
+                    `  ${s.source}  ${amount} · ${s.sessions} session${s.sessions === 1 ? '' : 's'}`));
             }
         }
 
