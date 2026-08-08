@@ -184,7 +184,7 @@ def opencode_rows():
         " COALESCE(tokens_cache_read, 0), model"
         " FROM session"
     ):
-        ts = created or updated
+        ts = updated or created
         if not ts:
             continue
         rows.append({

@@ -64,7 +64,10 @@ update the table if your model's pricing changes.
 ### Counting semantics
 
 `calls` counts one usage record per agent: a session row for opencode, and one
-API call for Claude Code / Codex messages. Claude Code sub-agent usage
+API call for Claude Code / Codex messages. Usage is attributed to the day of
+each record's **most recent activity** (for opencode, the session's
+`time_updated`) — so an opencode session that started yesterday but is still
+running today counts toward today. Claude Code sub-agent usage
 (`usage.iterations`) is intentionally not included — the top-level per-message
 usage is used, matching the behavior of other usage trackers.
 
