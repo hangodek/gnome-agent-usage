@@ -13,8 +13,8 @@ Outputs a single JSON object on stdout:
   "week":   {"cost": float, "tokens": int},
   "month":  {"cost": float, "tokens": int},
   "total":  {"cost": float, "tokens": int},
-  "per_model": [{"model": str, "cost": float, "tokens": int, "sessions": int}],
-  "sources": [{"source": str, "cost": float, "tokens": int, "sessions": int}],
+  "per_model": [{"model": str, "cost": float, "tokens": int, "calls": int}],
+  "sources": [{"source": str, "cost": float, "tokens": int, "calls": int}],
   "last7":  [{"day": "YYYY-MM-DD", "cost": float, "tokens": int}],
   "errors": [{"source": str, "error": str}]
 }
@@ -39,25 +39,39 @@ AGENTS = ("opencode", "claude", "codex")
 # Estimated per-token prices for Codex models (USD per 1M tokens).
 # Codex transcripts do not record cost, so this is an estimate, not a bill.
 CODEX_PRICES = {
-    "gpt-5-nano": (0.05, 0.40),
-    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-pro": (2.50, 12.50),
     "gpt-5": (1.25, 10.00),
-    "gpt-5-pro": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-4.5": (75.00, 150.00),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
-    "gpt-4.1": (2.00, 8.00),
-    "o3": (1.10, 4.40),
     "o4-mini": (1.10, 4.40),
+    "o3-mini": (1.10, 4.40),
+    "o3": (1.10, 4.40),
 }
 CODEX_DEFAULT_PRICE = (0.25, 2.00)
 
 
 # ---------------------------------------------------------------- sources
 
-def _ts_ms(value):
+def _to_float(value, default=0.0):
+    """Coerce a value to float, tolerating strings and missing values."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ts_ms(value, fallback_ms=None):
     """Normalize a timestamp (ms, seconds, or ISO-8601 string) to ms."""
     if value is None:
-        return None
+        return fallback_ms
     if isinstance(value, str):
         try:
             text = value.strip()
@@ -65,7 +79,7 @@ def _ts_ms(value):
                 text = text[:-1] + "+00:00"
             return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
         except ValueError:
-            return None
+            return fallback_ms
     if value < 1e12:
         value *= 1000
     return int(value)
@@ -119,7 +133,8 @@ def claude_rows():
         return rows
     cutoff = (time.time() - 40 * 86400) * 1000
     for path in glob.glob(os.path.join(CLAUDE_DIR, "**", "*.jsonl"), recursive=True):
-        if os.path.getmtime(path) * 1000 < cutoff:
+        mtime_ms = int(os.path.getmtime(path) * 1000)
+        if mtime_ms < cutoff:
             continue
         with open(path, errors="replace") as f:
             for line in f:
@@ -141,8 +156,8 @@ def claude_rows():
                     cost = usage.get("costUSD", 0.0)
                 rows.append({
                     "source": "claude",
-                    "ts": _ts_ms(ev.get("timestamp")),
-                    "cost": cost or 0.0,
+                    "ts": _ts_ms(ev.get("timestamp"), mtime_ms),
+                    "cost": _to_float(cost),
                     "tin": usage.get("input_tokens", 0),
                     "tout": usage.get("output_tokens", 0),
                     "tcache": usage.get("cache_read_input_tokens", 0)
@@ -158,7 +173,8 @@ def codex_rows():
         return rows
     cutoff = (time.time() - 40 * 86400) * 1000
     for path in glob.glob(os.path.join(CODEX_DIR, "**", "*.jsonl"), recursive=True):
-        if os.path.getmtime(path) * 1000 < cutoff:
+        mtime_ms = int(os.path.getmtime(path) * 1000)
+        if mtime_ms < cutoff:
             continue
         with open(path, errors="replace") as f:
             for line in f:
@@ -169,7 +185,7 @@ def codex_rows():
                     ev = json.loads(line)
                 except ValueError:
                     continue
-                ts = _ts_ms(ev.get("timestamp"))
+                ts = _ts_ms(ev.get("timestamp"), mtime_ms)
                 event_type = ev.get("type")
                 if event_type == "token_count":
                     # Current format: per-request usage in payload.info
@@ -216,10 +232,11 @@ def codex_rows():
 def codex_cost(model, tin, tout):
     """Estimated cost for a Codex message using the built-in price table."""
     rate = CODEX_DEFAULT_PRICE
+    best_len = -1
     for prefix, price in CODEX_PRICES.items():
-        if model.startswith(prefix):
+        if model.startswith(prefix) and len(prefix) > best_len:
+            best_len = len(prefix)
             rate = price
-            break
     return tin * rate[0] / 1e6 + tout * rate[1] / 1e6
 
 
@@ -227,15 +244,19 @@ def codex_cost(model, tin, tout):
 
 def is_active():
     active = []
-    for agent in AGENTS:
-        try:
-            r = subprocess.run(
-                ["pgrep", "-f", agent], capture_output=True, text=True, timeout=3
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                active.append(agent)
-        except Exception:
-            continue
+    try:
+        r = subprocess.run(
+            ["pgrep", "-af", "opencode|claude|codex"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            for agent in AGENTS:
+                for line in r.stdout.splitlines():
+                    if agent in line:
+                        active.append(agent)
+                        break
+    except Exception:
+        pass
     return active
 
 
@@ -273,17 +294,17 @@ def aggregate(rows):
             result["today"]["tokens"] += tokens
             key = r["model"] or "unknown"
             m = result["per_model"].setdefault(
-                key, {"model": key, "cost": 0.0, "tokens": 0, "sessions": 0}
+                key, {"model": key, "cost": 0.0, "tokens": 0, "calls": 0}
             )
             m["cost"] += cost
             m["tokens"] += tokens
-            m["sessions"] += 1
+            m["calls"] += 1
             s = result["sources"].setdefault(
-                r["source"], {"source": r["source"], "cost": 0.0, "tokens": 0, "sessions": 0}
+                r["source"], {"source": r["source"], "cost": 0.0, "tokens": 0, "calls": 0}
             )
             s["cost"] += cost
             s["tokens"] += tokens
-            s["sessions"] += 1
+            s["calls"] += 1
         if month_prefix == day[:7]:
             result["month"]["cost"] += cost
             result["month"]["tokens"] += tokens

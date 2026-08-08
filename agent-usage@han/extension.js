@@ -13,6 +13,8 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 const REFRESH_SECONDS = 60;
 
 function formatTokens(n) {
+    if (n >= 1_000_000_000)
+        return `${(n / 1_000_000_000).toFixed(2)}B`;
     if (n >= 1_000_000)
         return `${(n / 1_000_000).toFixed(2)}M`;
     if (n >= 1_000)
@@ -124,9 +126,30 @@ class AgentUsageButton extends PanelMenu.Button {
 
         this._label.text = today.cost > 0
             ? formatMoney(today.cost)
-            : `${formatTokens(today.tokens)} tok`;
+            : today.tokens > 0
+                ? `${formatTokens(today.tokens)} tok`
+                : 'no usage';
+
+        this.tooltip_text =
+            `Today ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok\n` +
+            `7 days ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok\n` +
+            `Month ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`;
 
         this._content.removeAll();
+
+        const nothing = today.cost === 0 && today.tokens === 0 &&
+            week.cost === 0 && total.cost === 0;
+
+        if (nothing) {
+            this._content.addMenuItem(this._row('No usage recorded yet', true));
+            this._content.addMenuItem(this._row('Run opencode, Claude Code, or Codex ' +
+                'to start tracking'));
+            this._content.addMenuItem(this._separator());
+            const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
+            refreshItem.connect('activate', () => this._refresh());
+            this._content.addMenuItem(refreshItem);
+            return;
+        }
 
         this._content.addMenuItem(this._row(
             `Today        ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok`, true));
@@ -149,7 +172,7 @@ class AgentUsageButton extends PanelMenu.Button {
             for (const m of per_model) {
                 const amount = m.cost > 0 ? formatMoney(m.cost) : `${formatTokens(m.tokens)} tok`;
                 this._content.addMenuItem(this._row(
-                    `  ${m.model}  ${amount} · ${m.sessions} session${m.sessions === 1 ? '' : 's'}`));
+                    `  ${m.model}  ${amount} · ${m.calls} call${m.calls === 1 ? '' : 's'}`));
             }
         }
 
@@ -159,7 +182,7 @@ class AgentUsageButton extends PanelMenu.Button {
             for (const s of sources) {
                 const amount = s.cost > 0 ? formatMoney(s.cost) : `${formatTokens(s.tokens)} tok`;
                 this._content.addMenuItem(this._row(
-                    `  ${s.source}  ${amount} · ${s.sessions} session${s.sessions === 1 ? '' : 's'}`));
+                    `  ${s.source}  ${amount} · ${s.calls} call${s.calls === 1 ? '' : 's'}`));
             }
         }
 
@@ -206,6 +229,9 @@ export default class AgentUsageExtension extends Extension {
             this._timer = null;
         }
         if (this._button !== null) {
+            // The menu actor lives in Main.uiGroup, not in the button —
+            // destroying only the button would leak it on every reload.
+            this._button.menu?.destroy();
             this._button.destroy();
             this._button = null;
         }

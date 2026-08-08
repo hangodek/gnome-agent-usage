@@ -43,5 +43,14 @@ gdbus call --session \
     --method org.gnome.Shell.Eval \
     "Main.extensionManager.reloadExtension('$UUID')" >/dev/null
 
-echo "reloaded $UUID — check errors with:"
-echo "  journalctl --since '10 seconds ago' -o cat | grep agent-usage"
+echo "reloaded $UUID"
+
+sleep 1
+
+ERRORS=$(journalctl --since '5 seconds ago' -o cat 2>/dev/null | grep "agent-usage" || true)
+if [ -n "$ERRORS" ]; then
+    echo "errors in the shell log:"
+    echo "$ERRORS"
+else
+    echo "no errors in the shell log"
+fi

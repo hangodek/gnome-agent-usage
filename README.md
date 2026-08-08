@@ -19,12 +19,15 @@ Agents with no data on your machine are simply skipped. Each source is read
 
 ## Features
 
-- **Panel indicator** showing today's cost (e.g. `$0.42`) or token count for free models
+- **Panel indicator** showing today's cost (e.g. `$0.42`), token count for free
+  models, or `no usage` when there is none
+- **Hover tooltip** with today / 7 days / month summary
 - **Dropdown menu** with today / last 7 days / this month / all-time totals
 - **Per-model and per-source breakdown** for today
 - **Last-7-days history** with daily cost and tokens
 - **Live activity** indicator listing every agent currently running
 - 60-second auto-refresh, plus refresh on menu open
+- Source read errors surface in the menu (`⚠ source: …`) instead of failing silently
 
 ## How it works
 
@@ -49,10 +52,18 @@ sessions stay frozen at the prices in effect when they ran.
 
 ### Codex cost disclaimer
 
-Codex transcripts only record tokens. `usage.py` estimates cost with a small
-built-in price table (`CODEX_PRICES` in `usage.py`, keyed by model prefix,
+Codex transcripts record per-request token usage (as `token_count` events) but
+no cost. `usage.py` estimates cost with a small built-in price table
+(`CODEX_PRICES` in `usage.py`, longest-prefix matched against the model name,
 falling back to conservative defaults). This is an **estimate, not a bill** —
 update the table if your model's pricing changes.
+
+### Counting semantics
+
+`calls` counts one usage record per agent: a session row for opencode, and one
+API call for Claude Code / Codex messages. Claude Code sub-agent usage
+(`usage.iterations`) is intentionally not included — the top-level per-message
+usage is used, matching the behavior of other usage trackers.
 
 ## Requirements
 
@@ -80,7 +91,8 @@ you must **log out and log back in** (or use the GNOME on Xorg session, where
 ## Usage
 
 - The panel button shows today's total: `$0.42` when there's a cost, `42K tok`
-  when the models used today are free.
+  when the models used today are free, `no usage` when nothing is recorded.
+- Hovering shows today / 7 days / month in a tooltip.
 - Click it for the full breakdown: today, 7 days, month, all time, per-model,
   per-source, last-7-days history, and a manual refresh item.
 - The data updates automatically every 60 seconds.
