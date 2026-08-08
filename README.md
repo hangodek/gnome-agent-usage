@@ -23,9 +23,9 @@ Agents with no data on your machine are simply skipped. Each source is read
   models, or `no usage` when there is none
 - **Hover tooltip** with today / 7 days / month summary
 - **Dropdown menu** with today / last 7 days / this month / all-time totals
-- **Since reset** counter: press **Reset baseline** (two-step confirm) and the
-  menu shows cost/tokens since that moment — a local marker, agent data is
-  never touched
+- **Reset today**: press **Reset today** (two-step confirm) and the today
+  counter restarts from `$0.00` at that moment — a local marker, agent data is
+  never touched. Back to normal automatically at midnight.
 - **Per-model and per-source breakdown** for today
 - **Last-7-days history** with daily cost and tokens
 - **Live activity** indicator listing every agent currently running
@@ -96,17 +96,22 @@ you must **log out and log back in** (or use the GNOME on Xorg session, where
 - The panel button shows today's total: `$0.42` when there's a cost, `42K tok`
   when the models used today are free, `no usage` when nothing is recorded.
 - Hovering shows today / 7 days / month in a tooltip.
-- Click it for the full breakdown: today, 7 days, month, all time, since-reset,
-  per-model, per-source, last-7-days history, and a manual refresh item.
+- Click it for the full breakdown: today, 7 days, month, all time, per-model,
+  per-source, last-7-days history, and a manual refresh item.
 - The data updates automatically every 60 seconds.
 
-### Reset baseline
+### Reset today
 
-The menu's **Reset baseline** item (two-step confirm) stores a local timestamp
-in `~/.local/share/agent-usage@han/state.json`; from then on a `Since reset`
-row shows cumulative cost/tokens after that moment, starting from `$0.00`.
-Nothing in opencode, Claude Code, or Codex data is modified. To undo, delete
-the state file.
+The menu's **Reset today** item (two-step confirm) stores a local timestamp in
+`~/.local/share/agent-usage@han/state.json`. While that timestamp falls within
+the current local day, the **today** counter (panel label, menu row, and
+today's per-model/per-source breakdowns) only counts usage after it —
+restarting from `$0.00` at the moment you pressed it. Other windows
+(7 days / month / all time) stay calendar-based.
+
+The reset only affects the day it was pressed: at midnight the today counter
+automatically starts counting the full new day again. Nothing in opencode,
+Claude Code, or Codex data is modified. To undo, delete the state file.
 
 ### Scan cache
 

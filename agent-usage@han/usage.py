@@ -13,12 +13,14 @@ Outputs a single JSON object on stdout:
   "week":   {"cost": float, "tokens": int},
   "month":  {"cost": float, "tokens": int},
   "total":  {"cost": float, "tokens": int},
-  "since_reset": {"cost": float, "tokens": int, "days": int}|null,
   "per_model": [{"model": str, "cost": float, "tokens": int, "calls": int}],
   "sources": [{"source": str, "cost": float, "tokens": int, "calls": int}],
   "last7":  [{"day": "YYYY-MM-DD", "cost": float, "tokens": int}],
   "errors": [{"source": str, "error": str}]
 }
+
+The "today" bucket only counts usage after the stored reset baseline when it
+falls within the current local day; all other buckets stay calendar-based.
 
 CLI:
   usage.py             report usage
@@ -365,7 +367,13 @@ def is_active():
 
 # ------------------------------------------------------------ aggregation
 
-def aggregate(rows):
+def aggregate(rows, baseline_ms=None):
+    """Aggregate normalized rows into day/period buckets.
+
+    When baseline_ms falls within the current local day, the "today" bucket
+    (and today's per-model/per-source breakdowns) only count usage after it.
+    All other buckets stay calendar-based.
+    """
     result = {
         "today": {"cost": 0.0, "tokens": 0},
         "week": {"cost": 0.0, "tokens": 0},
@@ -376,7 +384,13 @@ def aggregate(rows):
         "last7": {},
     }
     now = time.time()
+    now_ms = int(now * 1000)
     today = datetime.datetime.now().strftime("%Y-%m-%d")
+    day_start_ms = int(datetime.datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    today_cutoff = day_start_ms
+    if baseline_ms and day_start_ms < baseline_ms <= now_ms:
+        today_cutoff = baseline_ms
     week_cutoff = now - 6 * 86400
     month_prefix = datetime.datetime.now().strftime("%Y-%m")
     for r in rows:
@@ -392,7 +406,7 @@ def aggregate(rows):
             result["week"]["cost"] += cost
             result["week"]["tokens"] += tokens
         day = datetime.datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
-        if day == today:
+        if day == today and ts >= today_cutoff:
             result["today"]["cost"] += cost
             result["today"]["tokens"] += tokens
             key = r["model"] or "unknown"
@@ -418,25 +432,10 @@ def aggregate(rows):
     return result
 
 
-def since_reset(rows, baseline_ms):
-    if not baseline_ms:
-        return None
-    cost = 0.0
-    tokens = 0
-    for r in rows:
-        ts = r["ts"]
-        if ts and ts >= baseline_ms:
-            cost += r["cost"]
-            tokens += r["tin"] + r["tout"]
-    days = (datetime.date.today()
-            - datetime.datetime.fromtimestamp(baseline_ms / 1000).date()).days
-    return {"cost": round(cost, 4), "tokens": tokens, "days": days}
-
-
 def main():
     reset = "--reset" in sys.argv
     result = {
-        "version": 2,
+        "version": 3,
         "ok": True,
         "error": None,
         "active": is_active(),
@@ -444,7 +443,6 @@ def main():
         "week": {"cost": 0.0, "tokens": 0},
         "month": {"cost": 0.0, "tokens": 0},
         "total": {"cost": 0.0, "tokens": 0},
-        "since_reset": None,
         "per_model": [],
         "sources": [],
         "last7": [],
@@ -467,7 +465,11 @@ def main():
             except Exception as e:
                 result["errors"].append({"source": name, "error": f"{type(e).__name__}: {e}"})
 
-        agg = aggregate(rows)
+        if reset:
+            _write_state(int(time.time() * 1000))
+        baseline = _load_state()
+
+        agg = aggregate(rows, baseline)
         for key in ("today", "week", "month", "total"):
             result[key] = {
                 "cost": round(agg[key]["cost"], 4),
@@ -485,11 +487,6 @@ def main():
             }
             for d in sorted(agg["last7"].values(), key=lambda d: d["day"])
         ]
-
-        if reset:
-            _write_state(int(time.time() * 1000))
-        baseline = _load_state()
-        result["since_reset"] = since_reset(rows, baseline)
     except Exception as e:
         result["ok"] = False
         result["error"] = f"{type(e).__name__}: {e}"
