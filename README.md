@@ -29,7 +29,7 @@ Agents with no data on your machine are simply skipped. Each source is read
 - **Per-model and per-source breakdown** for today
 - **Last-7-days history** with daily cost and tokens
 - **Live activity** indicator listing every agent currently running
-- 60-second auto-refresh, plus refresh on menu open
+- 3-second auto-refresh, plus refresh on menu open
 - Source read errors surface in the menu (`⚠ source: …`) instead of failing silently
 
 ## How it works
@@ -121,8 +121,8 @@ Claude Code, or Codex data is modified. To undo, delete the state file.
 ### Scan cache
 
 Parsed JSONL transcripts are cached per file (keyed by mtime) in
-`~/.cache/agent-usage@han/scan-cache.json`, so repeated 60-second refreshes
-only re-read files that actually changed. Deleting the cache is safe.
+`~/.cache/agent-usage@han/scan-cache.json`, so repeated refreshes only re-read
+files that actually changed. Deleting the cache is safe.
 
 ## Development
 
@@ -146,6 +146,16 @@ every change. With GNOME Shell's "unsafe mode" you can reload instantly:
 > inside GNOME Shell (that's how the reload works). Use it only on a machine
 > you trust; it resets on every login.
 
+## Packaging
+
+Uploads to extensions.gnome.org must have `extension.js` and `metadata.json`
+**at the ZIP root** — a wrapping `agent-usage@han/` folder makes the upload
+fail with "Missing extension.js". Build the release zip with:
+
+```sh
+./package.sh
+```
+
 ## Files
 
 | File                        | Purpose                                                   |
@@ -154,6 +164,7 @@ every change. With GNOME Shell's "unsafe mode" you can reload instantly:
 | `agent-usage@han/usage.py`     | Read-only multi-source aggregator, prints JSON to stdout |
 | `agent-usage@han/metadata.json`| Extension metadata (uuid, shell-version)                 |
 | `dev-reload.sh`                | Development helper: reload the extension without restart |
+| `package.sh`                   | Builds the root-level zip required by extensions.gnome.org |
 
 ## Troubleshooting
 
