@@ -150,23 +150,25 @@ def _prune_cache_entries(entries, cutoff_ms):
 
 
 def _load_state():
+    """Return (reset_ts_ms, snapshot). Old-format files yield ({}, {}) snapshot."""
     try:
         with open(STATE_FILE) as f:
-            return json.load(f).get("reset_ts_ms")
+            data = json.load(f)
+            return data.get("reset_ts_ms"), data.get("snapshot") or {}
     except (OSError, ValueError):
-        return None
+        return None, {}
 
 
-def _write_state(reset_ts_ms):
-    """Store the reset baseline. Returns True on success."""
+def _write_state(reset_ts_ms, snapshot):
+    """Store the reset baseline and per-session snapshot. Returns True on success."""
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"reset_ts_ms": reset_ts_ms}, f)
+            json.dump({"reset_ts_ms": reset_ts_ms, "snapshot": snapshot}, f)
         os.replace(tmp, STATE_FILE)
         return True
-    except OSError as e:
+    except OSError:
         return False
 
 
@@ -178,8 +180,8 @@ def opencode_rows():
         return rows
     con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
     con.execute("PRAGMA busy_timeout = 2000")
-    for created, updated, cost, tin, tout, tcache, model in con.execute(
-        "SELECT time_created, time_updated, cost,"
+    for sid, created, updated, cost, tin, tout, tcache, model in con.execute(
+        "SELECT id, time_created, time_updated, cost,"
         " COALESCE(tokens_input, 0), COALESCE(tokens_output, 0),"
         " COALESCE(tokens_cache_read, 0), model"
         " FROM session"
@@ -189,6 +191,7 @@ def opencode_rows():
             continue
         rows.append({
             "source": "opencode",
+            "sid": sid,
             "ts": _ts_ms(ts),
             "cost": _to_float(cost),
             "tin": tin,
@@ -383,13 +386,16 @@ def is_active():
 
 # ------------------------------------------------------------ aggregation
 
-def aggregate(rows, baseline_ms=None):
+def aggregate(rows, baseline_ms=None, snapshot=None):
     """Aggregate normalized rows into day/period buckets.
 
     When baseline_ms falls within the current local day, the "today" bucket
     (and today's per-model/per-source breakdowns) only count usage after it.
-    All other buckets stay calendar-based.
+    For opencode sessions, a per-session snapshot taken at reset time
+    subtracts the usage that happened before the reset. All other buckets
+    stay calendar-based.
     """
+    snapshot = snapshot or {}
     result = {
         "today": {"cost": 0.0, "tokens": 0},
         "week": {"cost": 0.0, "tokens": 0},
@@ -424,21 +430,30 @@ def aggregate(rows, baseline_ms=None):
             result["week"]["tokens"] += tokens
         day = datetime.datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
         if day == today and ts >= today_cutoff:
-            result["today"]["cost"] += cost
-            result["today"]["tokens"] += tokens
-            key = r["model"] or "unknown"
-            m = result["per_model"].setdefault(
-                key, {"model": key, "cost": 0.0, "tokens": 0, "calls": 0}
-            )
-            m["cost"] += cost
-            m["tokens"] += tokens
-            m["calls"] += 1
-            s = result["sources"].setdefault(
-                r["source"], {"source": r["source"], "cost": 0.0, "tokens": 0, "calls": 0}
-            )
-            s["cost"] += cost
-            s["tokens"] += tokens
-            s["calls"] += 1
+            today_cost = cost
+            today_tokens = tokens
+            snap = snapshot.get(r.get("sid"))
+            if snap:
+                today_cost = max(0.0, cost - snap[2])
+                today_tokens = max(0, tokens - snap[0] - snap[1])
+            if today_cost == 0 and today_tokens == 0:
+                pass  # fully consumed before the reset — not part of today
+            else:
+                result["today"]["cost"] += today_cost
+                result["today"]["tokens"] += today_tokens
+                key = r["model"] or "unknown"
+                m = result["per_model"].setdefault(
+                    key, {"model": key, "cost": 0.0, "tokens": 0, "calls": 0}
+                )
+                m["cost"] += today_cost
+                m["tokens"] += today_tokens
+                m["calls"] += 1
+                s = result["sources"].setdefault(
+                    r["source"], {"source": r["source"], "cost": 0.0, "tokens": 0, "calls": 0}
+                )
+                s["cost"] += today_cost
+                s["tokens"] += today_tokens
+                s["calls"] += 1
         if month_prefix == day[:7]:
             result["month"]["cost"] += cost
             result["month"]["tokens"] += tokens
@@ -484,12 +499,19 @@ def main():
                 result["errors"].append({"source": name, "error": f"{type(e).__name__}: {e}"})
 
         if reset:
-            if not _write_state(int(time.time() * 1000)):
+            day_start_ms = int(datetime.datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+            snapshot = {
+                r["sid"]: [r["tin"], r["tout"], r["cost"]]
+                for r in rows
+                if r.get("source") == "opencode" and r["ts"] and r["ts"] >= day_start_ms
+            }
+            if not _write_state(int(time.time() * 1000), snapshot):
                 result["errors"].append(
                     {"source": "state", "error": f"cannot write {STATE_FILE}"})
-        baseline = _load_state()
+        baseline, snapshot = _load_state()
 
-        agg = aggregate(rows, baseline)
+        agg = aggregate(rows, baseline, snapshot)
         result["today_cutoff"] = agg["today_cutoff"]
         for key in ("today", "week", "month", "total"):
             result[key] = {

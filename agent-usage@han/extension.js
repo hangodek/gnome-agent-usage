@@ -64,8 +64,6 @@ class AgentUsageButton extends PanelMenu.Button {
         });
         this._pending = null;
         this._lastRefresh = null;
-        this._resetArmed = false;
-        this._resetArmTimeout = null;
         this._refresh();
     }
 
@@ -245,38 +243,12 @@ class AgentUsageButton extends PanelMenu.Button {
 
         this._content.addMenuItem(this._separator());
         const resetItem = new PopupMenu.PopupMenuItem('Reset today');
-        resetItem.connect('activate', () => {
-            if (!this._resetArmed) {
-                this._resetArmed = true;
-                resetItem.label.text = 'Reset today — click again to confirm';
-                this._resetArmTimeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
-                    if (!this._resetArmed)
-                        return GLib.SOURCE_REMOVE;
-                    this._resetArmed = false;
-                    this._resetArmTimeout = null;
-                    resetItem.label.text = 'Reset today';
-                    return GLib.SOURCE_REMOVE;
-                });
-                return;
-            }
-            this._resetArmed = false;
-            this._resetArmTimeout = null;
-            resetItem.label.text = 'Reset today';
-            this._resetToday();
-        });
+        resetItem.connect('activate', () => this._resetToday());
         this._content.addMenuItem(resetItem);
 
         const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
         refreshItem.connect('activate', () => this._refresh());
         this._content.addMenuItem(refreshItem);
-    }
-
-    _clearResetArm() {
-        if (this._resetArmTimeout !== null) {
-            GLib.source_remove(this._resetArmTimeout);
-            this._resetArmTimeout = null;
-        }
-        this._resetArmed = false;
     }
 }
 
@@ -298,10 +270,9 @@ export default class AgentUsageExtension extends Extension {
             GLib.source_remove(this._timer);
             this._timer = null;
         }
+        // The menu actor lives in Main.uiGroup, not in the button —
+        // destroying only the button would leak it on every reload.
         if (this._button !== null) {
-            this._button._clearResetArm();
-            // The menu actor lives in Main.uiGroup, not in the button —
-            // destroying only the button would leak it on every reload.
             this._button.menu?.destroy();
             this._button.destroy();
             this._button = null;

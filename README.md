@@ -23,9 +23,9 @@ Agents with no data on your machine are simply skipped. Each source is read
   models, or `$0.00` when there is no usage
 - **Hover tooltip** with today / 7 days / month summary
 - **Dropdown menu** with today / last 7 days / this month / all-time totals
-- **Reset today**: press **Reset today** (two-step confirm) and the today
-  counter restarts from `$0.00` at that moment — a local marker, agent data is
-  never touched. Back to normal automatically at midnight.
+- **Reset today**: press **Reset today** and the today counter restarts from
+  `$0.00` at that moment — a local marker, agent data is never touched.
+  Back to normal automatically at midnight.
 - **Per-model and per-source breakdown** for today
 - **Last-7-days history** with daily cost and tokens
 - **Live activity** indicator listing every agent currently running
@@ -105,12 +105,14 @@ you must **log out and log back in** (or use the GNOME on Xorg session, where
 
 ### Reset today
 
-The menu's **Reset today** item (two-step confirm) stores a local timestamp in
-`~/.local/share/agent-usage@han/state.json`. While that timestamp falls within
-the current local day, the **today** counter (panel label, menu row, and
-today's per-model/per-source breakdowns) only counts usage after it —
-restarting from `$0.00` at the moment you pressed it. Other windows
-(7 days / month / all time) stay calendar-based.
+The menu's **Reset today** item stores a local marker in
+`~/.local/share/agent-usage@han/state.json`, along with a per-session snapshot
+of every opencode session active today. While the marker falls within the
+current local day, the **today** counter (panel label, menu row, and today's
+per-model/per-source breakdowns) only counts usage after it — so even a
+long-running opencode session that spans the reset moment only contributes the
+usage it accumulates afterwards, and the counter genuinely restarts from
+`$0.00`. Other windows (7 days / month / all time) stay calendar-based.
 
 The reset only affects the day it was pressed: at midnight the today counter
 automatically starts counting the full new day again. Nothing in opencode,
