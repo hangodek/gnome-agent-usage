@@ -1,0 +1,7 @@
+{
+  "uuid": "agent-usage@han",
+  "name": "Agent Usage",
+  "description": "Tracks agentic AI usage (cost and tokens) from opencode's local database",
+  "shell-version": ["50"],
+  "version-name": "1.0"
+}
