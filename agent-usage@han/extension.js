@@ -10,9 +10,11 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-const REFRESH_SECONDS = 60;
+const REFRESH_SECONDS = 3;
 
 function formatTokens(n) {
+    if (n >= 1_000_000_000)
+        return `${(n / 1_000_000_000).toFixed(2)}B`;
     if (n >= 1_000_000)
         return `${(n / 1_000_000).toFixed(2)}M`;
     if (n >= 1_000)
@@ -21,6 +23,8 @@ function formatTokens(n) {
 }
 
 function formatMoney(cost) {
+    if (cost > 0 && cost < 0.01)
+        return `$${cost.toFixed(4)}`;
     return `$${cost.toFixed(2)}`;
 }
 
@@ -29,6 +33,13 @@ function formatDay(day) {
         weekday: 'short',
         month: 'short',
         day: 'numeric',
+    });
+}
+
+function formatTime(ts) {
+    return new Date(ts).toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
     });
 }
 
@@ -49,17 +60,33 @@ class AgentUsageButton extends PanelMenu.Button {
         this.menu.addMenuItem(this._content);
         this.menu.connect('open-state-changed', (menu, open) => {
             if (open)
-                this._refresh();
+                this._maybeRefresh();
         });
         this._pending = null;
+        this._lastRefresh = null;
+        this._lastErrorLog = null;
         this._refresh();
     }
 
-    _runHelper() {
+    _maybeRefresh() {
+        if (this._lastRefresh !== null && Date.now() - this._lastRefresh < 2000)
+            return;
+        this._refresh();
+    }
+
+    _logRateLimited(message) {
+        const now = Date.now();
+        if (this._lastErrorLog !== null && now - this._lastErrorLog < 30000)
+            return;
+        this._lastErrorLog = now;
+        log(`agent-usage: ${message}`);
+    }
+
+    _runHelper(extraArgs = []) {
         if (this._pending)
             return this._pending;
         const proc = Gio.Subprocess.new(
-            ['python3', `${this._extension.path}/usage.py`],
+            ['python3', `${this._extension.path}/usage.py`, ...extraArgs],
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
         );
         const task = new Promise((resolve, reject) => {
@@ -97,10 +124,21 @@ class AgentUsageButton extends PanelMenu.Button {
     async _refresh() {
         try {
             const data = await this._runHelper();
+            if (data.version !== 4)
+                this._logRateLimited(`unexpected schema version ${data.version}`);
+            this._lastRefresh = Date.now();
             this._render(data);
         } catch (e) {
-            this._label.text = '…';
-            log(`agent-usage: ${e}`);
+            this._logRateLimited(`${e}`);
+        }
+    }
+
+    async _resetToday() {
+        try {
+            await this._runHelper(['--reset']);
+            await this._refresh();
+        } catch (e) {
+            log(`agent-usage: reset failed: ${e}`);
         }
     }
 
@@ -116,16 +154,41 @@ class AgentUsageButton extends PanelMenu.Button {
     }
 
     _render(data) {
-        const {today, week, month, total, per_model, last7, active} = data;
+        const {today, today_cutoff, week, month, total, per_model, last7,
+            active, sources, errors} = data;
+        const activeList = Array.isArray(active) ? active : active ? [active] : [];
+        const errorList = Array.isArray(errors) ? errors : [];
+        const todayNote = today_cutoff ? ` (since ${formatTime(today_cutoff)})` : '';
 
         this._label.text = today.cost > 0
             ? formatMoney(today.cost)
-            : `${formatTokens(today.tokens)} tok`;
+            : today.tokens > 0
+                ? `${formatTokens(today.tokens)} tok`
+                : formatMoney(0);
+
+        this.tooltip_text =
+            `Today${todayNote} ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok\n` +
+            `7 days ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok\n` +
+            `Month ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`;
 
         this._content.removeAll();
 
+        const nothing = today.cost === 0 && today.tokens === 0 &&
+            week.cost === 0 && total.cost === 0;
+
+        if (nothing) {
+            this._content.addMenuItem(this._row('No usage recorded yet', true));
+            this._content.addMenuItem(this._row('Run opencode, Claude Code, or Codex ' +
+                'to start tracking'));
+            this._content.addMenuItem(this._separator());
+            const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
+            refreshItem.connect('activate', () => this._refresh());
+            this._content.addMenuItem(refreshItem);
+            return;
+        }
+
         this._content.addMenuItem(this._row(
-            `Today        ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok`, true));
+            `Today        ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok${todayNote}`, true));
         this._content.addMenuItem(this._row(
             `This 7 days  ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok`));
         this._content.addMenuItem(this._row(
@@ -135,7 +198,9 @@ class AgentUsageButton extends PanelMenu.Button {
 
         this._content.addMenuItem(this._separator());
         this._content.addMenuItem(this._row(
-            active ? `● ${active} — active now` : 'Idle — no agent session running'));
+            activeList.length > 0
+                ? `● ${activeList.join(', ')} — active now`
+                : 'Idle — no agent session running'));
 
         if (per_model.length > 0) {
             this._content.addMenuItem(this._separator());
@@ -143,7 +208,17 @@ class AgentUsageButton extends PanelMenu.Button {
             for (const m of per_model) {
                 const amount = m.cost > 0 ? formatMoney(m.cost) : `${formatTokens(m.tokens)} tok`;
                 this._content.addMenuItem(this._row(
-                    `  ${m.model}  ${amount} · ${m.sessions} session${m.sessions === 1 ? '' : 's'}`));
+                    `  ${m.model}  ${amount} · ${m.calls} call${m.calls === 1 ? '' : 's'}`));
+            }
+        }
+
+        if (sources.length > 0) {
+            this._content.addMenuItem(this._separator());
+            this._content.addMenuItem(this._row('Today by source', true));
+            for (const s of sources) {
+                const amount = s.cost > 0 ? formatMoney(s.cost) : `${formatTokens(s.tokens)} tok`;
+                this._content.addMenuItem(this._row(
+                    `  ${s.source}  ${amount} · ${s.calls} call${s.calls === 1 ? '' : 's'}`));
             }
         }
 
@@ -156,7 +231,26 @@ class AgentUsageButton extends PanelMenu.Button {
             }
         }
 
+        if (errorList.length > 0) {
+            this._content.addMenuItem(this._separator());
+            for (const e of errorList) {
+                const message = String(e.error || 'unknown error').slice(0, 60);
+                this._content.addMenuItem(this._row(`⚠ ${e.source}: ${message}`));
+            }
+        }
+
         this._content.addMenuItem(this._separator());
+        const asOf = new Date().toLocaleTimeString(undefined, {
+            hour: '2-digit',
+            minute: '2-digit',
+        });
+        this._content.addMenuItem(this._row(`As of ${asOf}`));
+
+        this._content.addMenuItem(this._separator());
+        const resetItem = new PopupMenu.PopupMenuItem('Reset today');
+        resetItem.connect('activate', () => this._resetToday());
+        this._content.addMenuItem(resetItem);
+
         const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
         refreshItem.connect('activate', () => this._refresh());
         this._content.addMenuItem(refreshItem);
@@ -181,7 +275,10 @@ export default class AgentUsageExtension extends Extension {
             GLib.source_remove(this._timer);
             this._timer = null;
         }
+        // The menu actor lives in Main.uiGroup, not in the button —
+        // destroying only the button would leak it on every reload.
         if (this._button !== null) {
+            this._button.menu?.destroy();
             this._button.destroy();
             this._button = null;
         }

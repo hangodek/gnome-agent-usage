@@ -1,30 +1,209 @@
 #!/usr/bin/env python3
-"""Read-only usage reporter for the opencode SQLite database.
+"""Read-only multi-source usage reporter for agentic AI tools.
+
+Sources:
+  - opencode     SQLite database at ~/.local/share/opencode/opencode.db
+  - Claude Code  JSONL transcripts at ~/.claude/projects/**/*.jsonl
+  - Codex CLI    JSONL transcripts at ~/.codex/sessions/**/*.jsonl
 
 Outputs a single JSON object on stdout:
 {
-  "ok": bool, "error": str|null, "active": str|null,
+  "version": int, "ok": bool, "error": str|null, "active": [str],
   "today":  {"cost": float, "tokens": int},
   "week":   {"cost": float, "tokens": int},
   "month":  {"cost": float, "tokens": int},
   "total":  {"cost": float, "tokens": int},
-  "per_model": [{"model": str, "cost": float, "tokens": int, "sessions": int}],
-  "last7":  [{"day": "YYYY-MM-DD", "cost": float, "tokens": int}]
+  "per_model": [{"model": str, "cost": float, "tokens": int, "calls": int}],
+  "sources": [{"source": str, "cost": float, "tokens": int, "calls": int}],
+  "last7":  [{"day": "YYYY-MM-DD", "cost": float, "tokens": int}],
+  "errors": [{"source": str, "error": str}]
 }
+
+The "today" bucket only counts usage after the stored reset baseline when it
+falls within the current local day; all other buckets stay calendar-based.
+
+CLI:
+  usage.py             report usage
+  usage.py --reset     store a "since reset" baseline at the current time
+
+Never writes to any source. State and scan caches live under the user's XDG
+data/cache directories. Each source is isolated: a failure in one does not
+affect the others.
 """
 
+import datetime
+import glob
 import json
 import os
 import sqlite3
 import subprocess
+import sys
+import time
 
-DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
+OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
+CODEX_DIR = os.path.expanduser("~/.codex/sessions")
 AGENTS = ("opencode", "claude", "codex")
-TS = "COALESCE(time_created, time_updated) / 1000"
-TOK = "COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)"
+
+SCAN_WINDOW_DAYS = 40
+XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+STATE_FILE = os.path.join(XDG_DATA_HOME, "agent-usage@han", "state.json")
+CACHE_FILE = os.path.join(XDG_CACHE_HOME, "agent-usage@han", "scan-cache.json")
+
+# Estimated per-token prices for Codex models (USD per 1M tokens).
+# Codex transcripts do not record cost, so this is an estimate, not a bill.
+CODEX_PRICES = {
+    "gpt-5-pro": (2.50, 12.50),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-4.5": (75.00, 150.00),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "o4-mini": (1.10, 4.40),
+    "o3-mini": (1.10, 4.40),
+    "o3": (1.10, 4.40),
+}
+CODEX_DEFAULT_PRICE = (0.25, 2.00)
 
 
-def model_label(raw):
+# ---------------------------------------------------------------- helpers
+
+def _to_float(value, default=0.0):
+    """Coerce a value to float, tolerating strings and missing values."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value, default=0):
+    """Coerce a value to int, tolerating strings and missing values."""
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ts_ms(value, fallback_ms=None):
+    """Normalize a timestamp (ms, seconds, or ISO-8601 string) to ms."""
+    if value is None:
+        return fallback_ms
+    if isinstance(value, str):
+        try:
+            text = value.strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
+        except ValueError:
+            return fallback_ms
+    if value < 1e12:
+        value *= 1000
+    return int(value)
+
+
+def _load_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {"claude": {}, "codex": {}}
+
+
+def _save_cache(cache):
+    try:
+        cutoff = (time.time() - SCAN_WINDOW_DAYS * 86400) * 1000
+        for value in cache.values():
+            if isinstance(value, dict):
+                _prune_cache_entries(value, cutoff)
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, CACHE_FILE)
+    except OSError:
+        pass
+
+
+def _prune_cache_entries(entries, cutoff_ms):
+    stale = [
+        path for path, entry in entries.items()
+        if (entry.get("m") or 0) // 1_000_000 < cutoff_ms
+        or not os.path.exists(path)
+    ]
+    for path in stale:
+        del entries[path]
+    if len(entries) > 2000:
+        for path in sorted(entries, key=lambda p: entries[p].get("m", 0))[: len(entries) - 2000]:
+            del entries[path]
+
+
+def _load_state():
+    """Return (reset_ts_ms, snapshot). Old-format files yield ({}, {}) snapshot."""
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+            return data.get("reset_ts_ms"), data.get("snapshot") or {}
+    except (OSError, ValueError):
+        return None, {}
+
+
+def _write_state(reset_ts_ms, snapshot):
+    """Store the reset baseline and per-session snapshot. Returns True on success."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"reset_ts_ms": reset_ts_ms, "snapshot": snapshot}, f)
+        os.replace(tmp, STATE_FILE)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- sources
+
+def opencode_rows():
+    rows = []
+    if not os.path.exists(OPENCODE_DB):
+        return rows
+    con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
+    con.execute("PRAGMA busy_timeout = 2000")
+    for sid, created, updated, cost, tin, tout, tcache, model in con.execute(
+        "SELECT id, time_created, time_updated, cost,"
+        " COALESCE(tokens_input, 0), COALESCE(tokens_output, 0),"
+        " COALESCE(tokens_cache_read, 0), model"
+        " FROM session"
+    ):
+        ts = updated or created
+        if not ts:
+            continue
+        rows.append({
+            "source": "opencode",
+            "sid": sid,
+            "ts": _ts_ms(ts),
+            "cost": _to_float(cost),
+            "tin": tin,
+            "tout": tout,
+            "tcache": tcache,
+            "model": opencode_model_label(model),
+        })
+    con.close()
+    return rows
+
+
+def opencode_model_label(raw):
     if not raw:
         return "unknown"
     try:
@@ -38,80 +217,319 @@ def model_label(raw):
         return raw
 
 
-def is_active():
-    for agent in AGENTS:
+def _claude_file_rows(path, mtime_ms):
+    rows = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            message = ev.get("message") or {}
+            usage = message.get("usage")
+            if not usage:
+                continue
+            # Real transcripts carry costUSD at the event top level
+            # (e.g. {"timestamp":..., "message":{...,"usage":{...}}, "costUSD":0.001})
+            cost = ev.get("costUSD")
+            if cost is None:
+                cost = usage.get("costUSD", 0.0)
+            rows.append({
+                "source": "claude",
+                "ts": _ts_ms(ev.get("timestamp"), mtime_ms),
+                "cost": _to_float(cost),
+                "tin": _to_int(usage.get("input_tokens")),
+                "tout": _to_int(usage.get("output_tokens")),
+                "tcache": _to_int(usage.get("cache_read_input_tokens"))
+                + _to_int(usage.get("cache_creation_input_tokens")),
+                "model": message.get("model") or "claude",
+            })
+    return rows
+
+
+def _codex_file_rows(path, mtime_ms):
+    rows = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            ts = _ts_ms(ev.get("timestamp"), mtime_ms)
+            event_type = ev.get("type")
+            if event_type == "token_count":
+                # Current format: per-request usage in payload.info
+                # (e.g. {"type":"token_count","timestamp":...,"payload":
+                #  {"info":{"model":...,"input_tokens":N,"output_tokens":N,
+                #   "cache_read_input_tokens":N},"total":{...}}})
+                info = (ev.get("payload") or {}).get("info") or {}
+                tin = _to_int(info.get("input_tokens"))
+                tout = _to_int(info.get("output_tokens")) \
+                    + _to_int(info.get("reasoning_output_tokens"))
+                if tin == 0 and tout == 0:
+                    continue
+                tcache = _to_int(info.get("cache_read_input_tokens")) \
+                    or _to_int(info.get("cached_input_tokens"))
+                model = info.get("model") or info.get("model_name") or "unknown"
+            elif event_type == "message":
+                # Legacy format: usage on the assistant message
+                # (e.g. {"type":"message","message":{...,"usage":
+                #  {"prompt_tokens":N,"completion_tokens":N,"model":M}}})
+                usage = (ev.get("message") or {}).get("usage")
+                if not usage:
+                    continue
+                tin = _to_int(usage.get("prompt_tokens"))
+                tout = _to_int(usage.get("completion_tokens"))
+                if tin == 0 and tout == 0:
+                    continue
+                tcache = _to_int(usage.get("cache_read_input_tokens"))
+                model = usage.get("model") \
+                    or (ev.get("message") or {}).get("model") or "unknown"
+            else:
+                continue
+            rows.append({
+                "source": "codex",
+                "ts": ts,
+                "cost": codex_cost(model, tin, tout),
+                "tin": tin,
+                "tout": tout,
+                "tcache": tcache,
+                "model": model,
+            })
+    return rows
+
+
+def _scan_jsonl_dir(root, cache_key, parser):
+    """Scan a JSONL directory, caching per-file results by mtime.
+
+    Returns (rows, errors). A single unreadable or corrupt file never
+    discards the rest of the source.
+    """
+    rows = []
+    errors = []
+    if not os.path.isdir(root):
+        return rows, errors
+    cache = _load_cache()
+    entries = cache.setdefault(cache_key, {})
+    cutoff = (time.time() - SCAN_WINDOW_DAYS * 86400) * 1000
+    changed = {}
+    for path in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
         try:
-            r = subprocess.run(
-                ["pgrep", "-f", agent], capture_output=True, text=True, timeout=3
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return agent
-        except Exception:
+            st = os.stat(path)
+        except OSError as e:
+            errors.append(f"{path}: {e}")
             continue
-    return None
+        mtime_ns = st.st_mtime_ns
+        if mtime_ns // 1_000_000 < cutoff:
+            continue
+        entry = entries.get(path)
+        if entry and entry.get("m") == mtime_ns:
+            rows.extend(entry["r"])
+            continue
+        try:
+            file_rows = parser(path, mtime_ns // 1_000_000)
+        except Exception as e:
+            errors.append(f"{path}: {type(e).__name__}: {e}")
+            continue
+        changed[path] = {"m": mtime_ns, "r": file_rows}
+        rows.extend(file_rows)
+    if changed:
+        entries.update(changed)
+        _save_cache(cache)
+    return rows, errors
 
 
-def main():
+def claude_rows():
+    return _scan_jsonl_dir(CLAUDE_DIR, "claude", _claude_file_rows)
+
+
+def codex_rows():
+    return _scan_jsonl_dir(CODEX_DIR, "codex", _codex_file_rows)
+
+
+def codex_cost(model, tin, tout):
+    """Estimated cost for a Codex message using the built-in price table."""
+    rate = CODEX_DEFAULT_PRICE
+    best_len = -1
+    for prefix, price in CODEX_PRICES.items():
+        if model.startswith(prefix) and len(prefix) > best_len:
+            best_len = len(prefix)
+            rate = price
+    return tin * rate[0] / 1e6 + tout * rate[1] / 1e6
+
+
+# ---------------------------------------------------------------- activity
+
+def is_active():
+    active = []
+    try:
+        r = subprocess.run(
+            ["pgrep", "-af", "opencode|claude|codex"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            for agent in AGENTS:
+                for line in r.stdout.splitlines():
+                    if agent in line:
+                        active.append(agent)
+                        break
+    except Exception:
+        pass
+    return active
+
+
+# ------------------------------------------------------------ aggregation
+
+def aggregate(rows, baseline_ms=None, snapshot=None):
+    """Aggregate normalized rows into day/period buckets.
+
+    When baseline_ms falls within the current local day, the "today" bucket
+    (and today's per-model/per-source breakdowns) only count usage after it.
+    For opencode sessions, a per-session snapshot taken at reset time
+    subtracts the usage that happened before the reset. All other buckets
+    stay calendar-based.
+    """
+    snapshot = snapshot or {}
     result = {
-        "ok": True,
-        "error": None,
-        "active": is_active(),
         "today": {"cost": 0.0, "tokens": 0},
         "week": {"cost": 0.0, "tokens": 0},
         "month": {"cost": 0.0, "tokens": 0},
         "total": {"cost": 0.0, "tokens": 0},
+        "per_model": {},
+        "sources": {},
+        "last7": {},
+    }
+    now = time.time()
+    now_ms = int(now * 1000)
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    day_start_ms = int(datetime.datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    today_cutoff = day_start_ms
+    if baseline_ms and day_start_ms < baseline_ms <= now_ms:
+        today_cutoff = baseline_ms
+    result["today_cutoff"] = today_cutoff if today_cutoff > day_start_ms else None
+    week_cutoff = now - 6 * 86400
+    month_prefix = datetime.datetime.now().strftime("%Y-%m")
+    for r in rows:
+        ts = r["ts"]
+        if not ts:
+            continue
+        tokens = r["tin"] + r["tout"]
+        cost = r["cost"]
+
+        result["total"]["cost"] += cost
+        result["total"]["tokens"] += tokens
+        if ts >= week_cutoff * 1000:
+            result["week"]["cost"] += cost
+            result["week"]["tokens"] += tokens
+        day = datetime.datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+        if day == today and ts >= today_cutoff:
+            today_cost = cost
+            today_tokens = tokens
+            snap = snapshot.get(r.get("sid"))
+            if snap:
+                today_cost = max(0.0, cost - snap[2])
+                today_tokens = max(0, tokens - snap[0] - snap[1])
+            if today_cost == 0 and today_tokens == 0:
+                pass  # fully consumed before the reset — not part of today
+            else:
+                result["today"]["cost"] += today_cost
+                result["today"]["tokens"] += today_tokens
+                key = r["model"] or "unknown"
+                m = result["per_model"].setdefault(
+                    key, {"model": key, "cost": 0.0, "tokens": 0, "calls": 0}
+                )
+                m["cost"] += today_cost
+                m["tokens"] += today_tokens
+                m["calls"] += 1
+                s = result["sources"].setdefault(
+                    r["source"], {"source": r["source"], "cost": 0.0, "tokens": 0, "calls": 0}
+                )
+                s["cost"] += today_cost
+                s["tokens"] += today_tokens
+                s["calls"] += 1
+        if month_prefix == day[:7]:
+            result["month"]["cost"] += cost
+            result["month"]["tokens"] += tokens
+        if ts >= week_cutoff * 1000:
+            d = result["last7"].setdefault(day, {"day": day, "cost": 0.0, "tokens": 0})
+            d["cost"] += cost
+            d["tokens"] += tokens
+    return result
+
+
+def main():
+    reset = "--reset" in sys.argv
+    result = {
+        "version": 4,
+        "ok": True,
+        "error": None,
+        "active": is_active(),
+        "today": {"cost": 0.0, "tokens": 0},
+        "today_cutoff": None,
+        "week": {"cost": 0.0, "tokens": 0},
+        "month": {"cost": 0.0, "tokens": 0},
+        "total": {"cost": 0.0, "tokens": 0},
         "per_model": [],
+        "sources": [],
         "last7": [],
+        "errors": [],
     }
     try:
-        if not os.path.exists(DB_PATH):
-            result["error"] = "opencode database not found"
-            print(json.dumps(result))
-            return
-        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        con.execute("PRAGMA busy_timeout = 2000")
+        rows = []
+        for name, fn in (("opencode", opencode_rows),
+                         ("claude", claude_rows),
+                         ("codex", codex_rows)):
+            try:
+                got = fn()
+                if isinstance(got, tuple):
+                    source_rows, file_errors = got
+                    rows.extend(source_rows)
+                    for err in file_errors:
+                        result["errors"].append({"source": name, "error": err})
+                else:
+                    rows.extend(got)
+            except Exception as e:
+                result["errors"].append({"source": name, "error": f"{type(e).__name__}: {e}"})
 
-        def agg(where):
-            row = con.execute(
-                f"SELECT COALESCE(SUM(cost), 0), COALESCE(SUM({TOK}), 0)"
-                f" FROM session WHERE {where}"
-            ).fetchone()
-            return {"cost": round(row[0], 4), "tokens": row[1]}
-
-        result["today"] = agg(
-            f"date({TS}, 'unixepoch', 'localtime') = date('now', 'localtime')"
-        )
-        result["week"] = agg(f"{TS} >= unixepoch('now', '-6 days')")
-        result["month"] = agg(
-            f"strftime('%Y-%m', {TS}, 'unixepoch', 'localtime')"
-            f" = strftime('%Y-%m', 'now', 'localtime')"
-        )
-        result["total"] = agg("1 = 1")
-
-        result["per_model"] = [
-            {
-                "model": model_label(r[0]),
-                "cost": round(r[1], 4),
-                "tokens": r[2],
-                "sessions": r[3],
+        if reset:
+            day_start_ms = int(datetime.datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+            snapshot = {
+                r["sid"]: [r["tin"], r["tout"], r["cost"]]
+                for r in rows
+                if r.get("source") == "opencode" and r["ts"] and r["ts"] >= day_start_ms
             }
-            for r in con.execute(
-                f"SELECT model, COALESCE(SUM(cost), 0), COALESCE(SUM({TOK}), 0), COUNT(*)"
-                f" FROM session"
-                f" WHERE date({TS}, 'unixepoch', 'localtime') = date('now', 'localtime')"
-                f" GROUP BY model ORDER BY COALESCE(SUM(cost), 0) DESC"
-            )
-        ]
+            if not _write_state(int(time.time() * 1000), snapshot):
+                result["errors"].append(
+                    {"source": "state", "error": f"cannot write {STATE_FILE}"})
+        baseline, snapshot = _load_state()
+
+        agg = aggregate(rows, baseline, snapshot)
+        result["today_cutoff"] = agg["today_cutoff"]
+        for key in ("today", "week", "month", "total"):
+            result[key] = {
+                "cost": round(agg[key]["cost"], 4),
+                "tokens": agg[key]["tokens"],
+            }
+        result["per_model"] = sorted(
+            agg["per_model"].values(), key=lambda m: -m["cost"])
+        result["sources"] = sorted(
+            agg["sources"].values(), key=lambda s: -s["cost"])
         result["last7"] = [
-            {"day": r[0], "cost": round(r[1], 4), "tokens": r[2]}
-            for r in con.execute(
-                f"SELECT date({TS}, 'unixepoch', 'localtime'),"
-                f" COALESCE(SUM(cost), 0), COALESCE(SUM({TOK}), 0)"
-                f" FROM session WHERE {TS} >= unixepoch('now', '-6 days')"
-                f" GROUP BY 1 ORDER BY 1"
-            )
+            {
+                "day": d["day"],
+                "cost": round(d["cost"], 4),
+                "tokens": d["tokens"],
+            }
+            for d in sorted(agg["last7"].values(), key=lambda d: d["day"])
         ]
-        con.close()
     except Exception as e:
         result["ok"] = False
         result["error"] = f"{type(e).__name__}: {e}"
