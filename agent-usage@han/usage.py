@@ -407,6 +407,7 @@ def aggregate(rows, baseline_ms=None):
     today_cutoff = day_start_ms
     if baseline_ms and day_start_ms < baseline_ms <= now_ms:
         today_cutoff = baseline_ms
+    result["today_cutoff"] = today_cutoff if today_cutoff > day_start_ms else None
     week_cutoff = now - 6 * 86400
     month_prefix = datetime.datetime.now().strftime("%Y-%m")
     for r in rows:
@@ -451,11 +452,12 @@ def aggregate(rows, baseline_ms=None):
 def main():
     reset = "--reset" in sys.argv
     result = {
-        "version": 3,
+        "version": 4,
         "ok": True,
         "error": None,
         "active": is_active(),
         "today": {"cost": 0.0, "tokens": 0},
+        "today_cutoff": None,
         "week": {"cost": 0.0, "tokens": 0},
         "month": {"cost": 0.0, "tokens": 0},
         "total": {"cost": 0.0, "tokens": 0},
@@ -488,6 +490,7 @@ def main():
         baseline = _load_state()
 
         agg = aggregate(rows, baseline)
+        result["today_cutoff"] = agg["today_cutoff"]
         for key in ("today", "week", "month", "total"):
             result[key] = {
                 "cost": round(agg[key]["cost"], 4),

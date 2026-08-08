@@ -36,6 +36,13 @@ function formatDay(day) {
     });
 }
 
+function formatTime(ts) {
+    return new Date(ts).toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+    });
+}
+
 class AgentUsageButton extends PanelMenu.Button {
     static {
         GObject.registerClass(this);
@@ -110,7 +117,7 @@ class AgentUsageButton extends PanelMenu.Button {
     async _refresh() {
         try {
             const data = await this._runHelper();
-            if (data.version !== 3)
+            if (data.version !== 4)
                 log(`agent-usage: unexpected schema version ${data.version}`);
             this._lastRefresh = Date.now();
             this._render(data);
@@ -140,10 +147,11 @@ class AgentUsageButton extends PanelMenu.Button {
     }
 
     _render(data) {
-        const {today, week, month, total, per_model, last7,
+        const {today, today_cutoff, week, month, total, per_model, last7,
             active, sources, errors} = data;
         const activeList = Array.isArray(active) ? active : active ? [active] : [];
         const errorList = Array.isArray(errors) ? errors : [];
+        const todayNote = today_cutoff ? ` (since ${formatTime(today_cutoff)})` : '';
 
         this._label.text = today.cost > 0
             ? formatMoney(today.cost)
@@ -152,7 +160,7 @@ class AgentUsageButton extends PanelMenu.Button {
                 : formatMoney(0);
 
         this.tooltip_text =
-            `Today ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok\n` +
+            `Today${todayNote} ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok\n` +
             `7 days ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok\n` +
             `Month ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`;
 
@@ -177,7 +185,7 @@ class AgentUsageButton extends PanelMenu.Button {
         }
 
         this._content.addMenuItem(this._row(
-            `Today        ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok`, true));
+            `Today        ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok${todayNote}`, true));
         this._content.addMenuItem(this._row(
             `This 7 days  ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok`));
         this._content.addMenuItem(this._row(
