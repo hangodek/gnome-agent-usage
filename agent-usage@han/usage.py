@@ -8,19 +8,25 @@ Sources:
 
 Outputs a single JSON object on stdout:
 {
-  "ok": bool, "error": str|null, "active": [str],
+  "version": int, "ok": bool, "error": str|null, "active": [str],
   "today":  {"cost": float, "tokens": int},
   "week":   {"cost": float, "tokens": int},
   "month":  {"cost": float, "tokens": int},
   "total":  {"cost": float, "tokens": int},
+  "since_reset": {"cost": float, "tokens": int, "days": int}|null,
   "per_model": [{"model": str, "cost": float, "tokens": int, "calls": int}],
   "sources": [{"source": str, "cost": float, "tokens": int, "calls": int}],
   "last7":  [{"day": "YYYY-MM-DD", "cost": float, "tokens": int}],
   "errors": [{"source": str, "error": str}]
 }
 
-Never writes to any source. Each source is isolated: a failure in one does
-not affect the others.
+CLI:
+  usage.py             report usage
+  usage.py --reset     store a "since reset" baseline at the current time
+
+Never writes to any source. State and scan caches live under the user's XDG
+data/cache directories. Each source is isolated: a failure in one does not
+affect the others.
 """
 
 import datetime
@@ -29,12 +35,19 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
 CODEX_DIR = os.path.expanduser("~/.codex/sessions")
 AGENTS = ("opencode", "claude", "codex")
+
+SCAN_WINDOW_DAYS = 40
+XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+STATE_FILE = os.path.join(XDG_DATA_HOME, "agent-usage@han", "state.json")
+CACHE_FILE = os.path.join(XDG_CACHE_HOME, "agent-usage@han", "scan-cache.json")
 
 # Estimated per-token prices for Codex models (USD per 1M tokens).
 # Codex transcripts do not record cost, so this is an estimate, not a bill.
@@ -56,7 +69,7 @@ CODEX_PRICES = {
 CODEX_DEFAULT_PRICE = (0.25, 2.00)
 
 
-# ---------------------------------------------------------------- sources
+# ---------------------------------------------------------------- helpers
 
 def _to_float(value, default=0.0):
     """Coerce a value to float, tolerating strings and missing values."""
@@ -85,6 +98,61 @@ def _ts_ms(value, fallback_ms=None):
     return int(value)
 
 
+def _load_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {"claude": {}, "codex": {}}
+
+
+def _save_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, CACHE_FILE)
+    except OSError:
+        pass
+
+
+def _prune_cache_entries(entries, cutoff_ms):
+    stale = [
+        path for path, entry in entries.items()
+        if (entry.get("m") or 0) // 1_000_000 < cutoff_ms
+    ]
+    for path in stale:
+        del entries[path]
+    if len(entries) > 2000:
+        for path in sorted(entries, key=lambda p: entries[p].get("m", 0))[: len(entries) - 2000]:
+            del entries[path]
+
+
+def _load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("reset_ts_ms")
+    except (OSError, ValueError):
+        return None
+
+
+def _write_state(reset_ts_ms):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"reset_ts_ms": reset_ts_ms}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- sources
+
 def opencode_rows():
     rows = []
     if not os.path.exists(OPENCODE_DB):
@@ -103,7 +171,7 @@ def opencode_rows():
         rows.append({
             "source": "opencode",
             "ts": _ts_ms(ts),
-            "cost": cost or 0.0,
+            "cost": _to_float(cost),
             "tin": tin,
             "tout": tout,
             "tcache": tcache,
@@ -127,106 +195,141 @@ def opencode_model_label(raw):
         return raw
 
 
-def claude_rows():
+def _claude_file_rows(path, mtime_ms):
     rows = []
-    if not os.path.isdir(CLAUDE_DIR):
-        return rows
-    cutoff = (time.time() - 40 * 86400) * 1000
-    for path in glob.glob(os.path.join(CLAUDE_DIR, "**", "*.jsonl"), recursive=True):
-        mtime_ms = int(os.path.getmtime(path) * 1000)
-        if mtime_ms < cutoff:
-            continue
-        with open(path, errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            message = ev.get("message") or {}
+            usage = message.get("usage")
+            if not usage:
+                continue
+            # Real transcripts carry costUSD at the event top level
+            # (e.g. {"timestamp":..., "message":{...,"usage":{...}}, "costUSD":0.001})
+            cost = ev.get("costUSD")
+            if cost is None:
+                cost = usage.get("costUSD", 0.0)
+            rows.append({
+                "source": "claude",
+                "ts": _ts_ms(ev.get("timestamp"), mtime_ms),
+                "cost": _to_float(cost),
+                "tin": usage.get("input_tokens", 0),
+                "tout": usage.get("output_tokens", 0),
+                "tcache": usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0),
+                "model": message.get("model") or "claude",
+            })
+    return rows
+
+
+def _codex_file_rows(path, mtime_ms):
+    rows = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            ts = _ts_ms(ev.get("timestamp"), mtime_ms)
+            event_type = ev.get("type")
+            if event_type == "token_count":
+                # Current format: per-request usage in payload.info
+                # (e.g. {"type":"token_count","timestamp":...,"payload":
+                #  {"info":{"model":...,"input_tokens":N,"output_tokens":N,
+                #   "cache_read_input_tokens":N},"total":{...}}})
+                info = (ev.get("payload") or {}).get("info") or {}
+                tin = info.get("input_tokens", 0)
+                tout = info.get("output_tokens", 0) \
+                    + info.get("reasoning_output_tokens", 0)
+                if tin == 0 and tout == 0:
                     continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                message = ev.get("message") or {}
-                usage = message.get("usage")
+                tcache = info.get("cache_read_input_tokens", 0) \
+                    or info.get("cached_input_tokens", 0)
+                model = info.get("model") or info.get("model_name") or "unknown"
+            elif event_type == "message":
+                # Legacy format: usage on the assistant message
+                # (e.g. {"type":"message","message":{...,"usage":
+                #  {"prompt_tokens":N,"completion_tokens":N,"model":M}}})
+                usage = (ev.get("message") or {}).get("usage")
                 if not usage:
                     continue
-                # Real transcripts carry costUSD at the event top level
-                # (e.g. {"timestamp":..., "message":{...,"usage":{...}}, "costUSD":0.001})
-                cost = ev.get("costUSD")
-                if cost is None:
-                    cost = usage.get("costUSD", 0.0)
-                rows.append({
-                    "source": "claude",
-                    "ts": _ts_ms(ev.get("timestamp"), mtime_ms),
-                    "cost": _to_float(cost),
-                    "tin": usage.get("input_tokens", 0),
-                    "tout": usage.get("output_tokens", 0),
-                    "tcache": usage.get("cache_read_input_tokens", 0)
-                    + usage.get("cache_creation_input_tokens", 0),
-                    "model": message.get("model") or "claude",
-                })
+                tin = usage.get("prompt_tokens", 0)
+                tout = usage.get("completion_tokens", 0)
+                if tin == 0 and tout == 0:
+                    continue
+                tcache = usage.get("cache_read_input_tokens", 0)
+                model = usage.get("model") \
+                    or (ev.get("message") or {}).get("model") or "unknown"
+            else:
+                continue
+            rows.append({
+                "source": "codex",
+                "ts": ts,
+                "cost": codex_cost(model, tin, tout),
+                "tin": tin,
+                "tout": tout,
+                "tcache": tcache,
+                "model": model,
+            })
     return rows
+
+
+def _scan_jsonl_dir(root, cache_key, parser):
+    """Scan a JSONL directory, caching per-file results by mtime.
+
+    Returns (rows, errors). A single unreadable or corrupt file never
+    discards the rest of the source.
+    """
+    rows = []
+    errors = []
+    if not os.path.isdir(root):
+        return rows, errors
+    cache = _load_cache()
+    entries = cache.setdefault(cache_key, {})
+    cutoff = (time.time() - SCAN_WINDOW_DAYS * 86400) * 1000
+    changed = {}
+    for path in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            errors.append(f"{path}: {e}")
+            continue
+        mtime_ns = st.st_mtime_ns
+        if mtime_ns // 1_000_000 < cutoff:
+            continue
+        entry = entries.get(path)
+        if entry and entry.get("m") == mtime_ns:
+            rows.extend(entry["r"])
+            continue
+        try:
+            file_rows = parser(path, mtime_ns // 1_000_000)
+        except Exception as e:
+            errors.append(f"{path}: {type(e).__name__}: {e}")
+            continue
+        changed[path] = {"m": mtime_ns, "r": file_rows}
+        rows.extend(file_rows)
+    if changed:
+        entries.update(changed)
+        _prune_cache_entries(entries, cutoff)
+        _save_cache(cache)
+    return rows, errors
+
+
+def claude_rows():
+    return _scan_jsonl_dir(CLAUDE_DIR, "claude", _claude_file_rows)
 
 
 def codex_rows():
-    rows = []
-    if not os.path.isdir(CODEX_DIR):
-        return rows
-    cutoff = (time.time() - 40 * 86400) * 1000
-    for path in glob.glob(os.path.join(CODEX_DIR, "**", "*.jsonl"), recursive=True):
-        mtime_ms = int(os.path.getmtime(path) * 1000)
-        if mtime_ms < cutoff:
-            continue
-        with open(path, errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                ts = _ts_ms(ev.get("timestamp"), mtime_ms)
-                event_type = ev.get("type")
-                if event_type == "token_count":
-                    # Current format: per-request usage in payload.info
-                    # (e.g. {"type":"token_count","timestamp":...,"payload":
-                    #  {"info":{"model":...,"input_tokens":N,"output_tokens":N,
-                    #   "cache_read_input_tokens":N},"total":{...}}})
-                    info = (ev.get("payload") or {}).get("info") or {}
-                    tin = info.get("input_tokens", 0)
-                    tout = info.get("output_tokens", 0) \
-                        + info.get("reasoning_output_tokens", 0)
-                    if tin == 0 and tout == 0:
-                        continue
-                    tcache = info.get("cache_read_input_tokens", 0) \
-                        or info.get("cached_input_tokens", 0)
-                    model = info.get("model") or info.get("model_name") or "unknown"
-                elif event_type == "message":
-                    # Legacy format: usage on the assistant message
-                    # (e.g. {"type":"message","message":{...,"usage":
-                    #  {"prompt_tokens":N,"completion_tokens":N,"model":M}}})
-                    usage = (ev.get("message") or {}).get("usage")
-                    if not usage:
-                        continue
-                    tin = usage.get("prompt_tokens", 0)
-                    tout = usage.get("completion_tokens", 0)
-                    if tin == 0 and tout == 0:
-                        continue
-                    tcache = usage.get("cache_read_input_tokens", 0)
-                    model = usage.get("model") \
-                        or (ev.get("message") or {}).get("model") or "unknown"
-                else:
-                    continue
-                rows.append({
-                    "source": "codex",
-                    "ts": ts,
-                    "cost": codex_cost(model, tin, tout),
-                    "tin": tin,
-                    "tout": tout,
-                    "tcache": tcache,
-                    "model": model,
-                })
-    return rows
+    return _scan_jsonl_dir(CODEX_DIR, "codex", _codex_file_rows)
 
 
 def codex_cost(model, tin, tout):
@@ -315,8 +418,25 @@ def aggregate(rows):
     return result
 
 
+def since_reset(rows, baseline_ms):
+    if not baseline_ms:
+        return None
+    cost = 0.0
+    tokens = 0
+    for r in rows:
+        ts = r["ts"]
+        if ts and ts >= baseline_ms:
+            cost += r["cost"]
+            tokens += r["tin"] + r["tout"]
+    days = (datetime.date.today()
+            - datetime.datetime.fromtimestamp(baseline_ms / 1000).date()).days
+    return {"cost": round(cost, 4), "tokens": tokens, "days": days}
+
+
 def main():
+    reset = "--reset" in sys.argv
     result = {
+        "version": 2,
         "ok": True,
         "error": None,
         "active": is_active(),
@@ -324,6 +444,7 @@ def main():
         "week": {"cost": 0.0, "tokens": 0},
         "month": {"cost": 0.0, "tokens": 0},
         "total": {"cost": 0.0, "tokens": 0},
+        "since_reset": None,
         "per_model": [],
         "sources": [],
         "last7": [],
@@ -335,7 +456,14 @@ def main():
                          ("claude", claude_rows),
                          ("codex", codex_rows)):
             try:
-                rows.extend(fn())
+                got = fn()
+                if isinstance(got, tuple):
+                    source_rows, file_errors = got
+                    rows.extend(source_rows)
+                    for err in file_errors:
+                        result["errors"].append({"source": name, "error": err})
+                else:
+                    rows.extend(got)
             except Exception as e:
                 result["errors"].append({"source": name, "error": f"{type(e).__name__}: {e}"})
 
@@ -357,6 +485,11 @@ def main():
             }
             for d in sorted(agg["last7"].values(), key=lambda d: d["day"])
         ]
+
+        if reset:
+            _write_state(int(time.time() * 1000))
+        baseline = _load_state()
+        result["since_reset"] = since_reset(rows, baseline)
     except Exception as e:
         result["ok"] = False
         result["error"] = f"{type(e).__name__}: {e}"

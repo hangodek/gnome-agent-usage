@@ -23,6 +23,9 @@ Agents with no data on your machine are simply skipped. Each source is read
   models, or `no usage` when there is none
 - **Hover tooltip** with today / 7 days / month summary
 - **Dropdown menu** with today / last 7 days / this month / all-time totals
+- **Since reset** counter: press **Reset baseline** (two-step confirm) and the
+  menu shows cost/tokens since that moment — a local marker, agent data is
+  never touched
 - **Per-model and per-source breakdown** for today
 - **Last-7-days history** with daily cost and tokens
 - **Live activity** indicator listing every agent currently running
@@ -93,9 +96,23 @@ you must **log out and log back in** (or use the GNOME on Xorg session, where
 - The panel button shows today's total: `$0.42` when there's a cost, `42K tok`
   when the models used today are free, `no usage` when nothing is recorded.
 - Hovering shows today / 7 days / month in a tooltip.
-- Click it for the full breakdown: today, 7 days, month, all time, per-model,
-  per-source, last-7-days history, and a manual refresh item.
+- Click it for the full breakdown: today, 7 days, month, all time, since-reset,
+  per-model, per-source, last-7-days history, and a manual refresh item.
 - The data updates automatically every 60 seconds.
+
+### Reset baseline
+
+The menu's **Reset baseline** item (two-step confirm) stores a local timestamp
+in `~/.local/share/agent-usage@han/state.json`; from then on a `Since reset`
+row shows cumulative cost/tokens after that moment, starting from `$0.00`.
+Nothing in opencode, Claude Code, or Codex data is modified. To undo, delete
+the state file.
+
+### Scan cache
+
+Parsed JSONL transcripts are cached per file (keyed by mtime) in
+`~/.cache/agent-usage@han/scan-cache.json`, so repeated 60-second refreshes
+only re-read files that actually changed. Deleting the cache is safe.
 
 ## Development
 

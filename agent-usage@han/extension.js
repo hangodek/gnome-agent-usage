@@ -53,17 +53,24 @@ class AgentUsageButton extends PanelMenu.Button {
         this.menu.addMenuItem(this._content);
         this.menu.connect('open-state-changed', (menu, open) => {
             if (open)
-                this._refresh();
+                this._maybeRefresh();
         });
         this._pending = null;
+        this._lastRefresh = null;
         this._refresh();
     }
 
-    _runHelper() {
+    _maybeRefresh() {
+        if (this._lastRefresh !== null && Date.now() - this._lastRefresh < 5000)
+            return;
+        this._refresh();
+    }
+
+    _runHelper(extraArgs = []) {
         if (this._pending)
             return this._pending;
         const proc = Gio.Subprocess.new(
-            ['python3', `${this._extension.path}/usage.py`],
+            ['python3', `${this._extension.path}/usage.py`, ...extraArgs],
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
         );
         const task = new Promise((resolve, reject) => {
@@ -101,10 +108,21 @@ class AgentUsageButton extends PanelMenu.Button {
     async _refresh() {
         try {
             const data = await this._runHelper();
+            if (data.version !== 2)
+                log(`agent-usage: unexpected schema version ${data.version}`);
+            this._lastRefresh = Date.now();
             this._render(data);
         } catch (e) {
-            this._label.text = '…';
             log(`agent-usage: ${e}`);
+        }
+    }
+
+    async _resetBaseline() {
+        try {
+            await this._runHelper(['--reset']);
+            await this._refresh();
+        } catch (e) {
+            log(`agent-usage: reset failed: ${e}`);
         }
     }
 
@@ -120,7 +138,8 @@ class AgentUsageButton extends PanelMenu.Button {
     }
 
     _render(data) {
-        const {today, week, month, total, per_model, last7, active, sources, errors} = data;
+        const {today, week, month, total, since_reset, per_model, last7,
+            active, sources, errors} = data;
         const activeList = Array.isArray(active) ? active : active ? [active] : [];
         const errorList = Array.isArray(errors) ? errors : [];
 
@@ -159,6 +178,12 @@ class AgentUsageButton extends PanelMenu.Button {
             `This month   ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`));
         this._content.addMenuItem(this._row(
             `All time     ${formatMoney(total.cost)} · ${formatTokens(total.tokens)} tok`));
+
+        if (since_reset) {
+            this._content.addMenuItem(this._row(
+                `Since reset  ${formatMoney(since_reset.cost)} · ` +
+                `${formatTokens(since_reset.tokens)} tok · ${since_reset.days}d`));
+        }
 
         this._content.addMenuItem(this._separator());
         this._content.addMenuItem(this._row(
@@ -204,6 +229,32 @@ class AgentUsageButton extends PanelMenu.Button {
         }
 
         this._content.addMenuItem(this._separator());
+        const asOf = new Date().toLocaleTimeString(undefined, {
+            hour: '2-digit',
+            minute: '2-digit',
+        });
+        this._content.addMenuItem(this._row(`As of ${asOf}`));
+
+        this._content.addMenuItem(this._separator());
+        let resetArmed = false;
+        const resetItem = new PopupMenu.PopupMenuItem('Reset baseline');
+        resetItem.connect('activate', () => {
+            if (!resetArmed) {
+                resetArmed = true;
+                resetItem.label.text = 'Reset baseline — click again to confirm';
+                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+                    resetArmed = false;
+                    resetItem.label.text = 'Reset baseline';
+                    return GLib.SOURCE_REMOVE;
+                });
+                return;
+            }
+            resetArmed = false;
+            resetItem.label.text = 'Reset baseline';
+            this._resetBaseline();
+        });
+        this._content.addMenuItem(resetItem);
+
         const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
         refreshItem.connect('activate', () => this._refresh());
         this._content.addMenuItem(refreshItem);
