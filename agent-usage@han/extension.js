@@ -10,7 +10,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-const REFRESH_SECONDS = 60;
+const REFRESH_SECONDS = 3;
 
 function formatTokens(n) {
     if (n >= 1_000_000_000)
@@ -64,13 +64,22 @@ class AgentUsageButton extends PanelMenu.Button {
         });
         this._pending = null;
         this._lastRefresh = null;
+        this._lastErrorLog = null;
         this._refresh();
     }
 
     _maybeRefresh() {
-        if (this._lastRefresh !== null && Date.now() - this._lastRefresh < 5000)
+        if (this._lastRefresh !== null && Date.now() - this._lastRefresh < 2000)
             return;
         this._refresh();
+    }
+
+    _logRateLimited(message) {
+        const now = Date.now();
+        if (this._lastErrorLog !== null && now - this._lastErrorLog < 30000)
+            return;
+        this._lastErrorLog = now;
+        log(`agent-usage: ${message}`);
     }
 
     _runHelper(extraArgs = []) {
@@ -116,11 +125,11 @@ class AgentUsageButton extends PanelMenu.Button {
         try {
             const data = await this._runHelper();
             if (data.version !== 4)
-                log(`agent-usage: unexpected schema version ${data.version}`);
+                this._logRateLimited(`unexpected schema version ${data.version}`);
             this._lastRefresh = Date.now();
             this._render(data);
         } catch (e) {
-            log(`agent-usage: ${e}`);
+            this._logRateLimited(`${e}`);
         }
     }
 
