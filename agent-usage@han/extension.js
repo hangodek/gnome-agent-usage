@@ -162,10 +162,6 @@ class AgentUsageButton extends PanelMenu.Button {
             `7 days ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok\n` +
             `Month ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`;
 
-        // Cancel any pending reset-confirmation timer: the menu items are
-        // destroyed below, and the timer must never touch a destroyed actor.
-        this._clearResetArm();
-
         this._content.removeAll();
 
         const nothing = today.cost === 0 && today.tokens === 0 &&
