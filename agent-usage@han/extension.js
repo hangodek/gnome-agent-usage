@@ -57,6 +57,8 @@ class AgentUsageButton extends PanelMenu.Button {
         });
         this._pending = null;
         this._lastRefresh = null;
+        this._resetArmed = false;
+        this._resetArmTimeout = null;
         this._refresh();
     }
 
@@ -154,6 +156,10 @@ class AgentUsageButton extends PanelMenu.Button {
             `7 days ${formatMoney(week.cost)} · ${formatTokens(week.tokens)} tok\n` +
             `Month ${formatMoney(month.cost)} · ${formatTokens(month.tokens)} tok`;
 
+        // Cancel any pending reset-confirmation timer: the menu items are
+        // destroyed below, and the timer must never touch a destroyed actor.
+        this._clearResetArm();
+
         this._content.removeAll();
 
         const nothing = today.cost === 0 && today.tokens === 0 &&
@@ -230,20 +236,23 @@ class AgentUsageButton extends PanelMenu.Button {
         this._content.addMenuItem(this._row(`As of ${asOf}`));
 
         this._content.addMenuItem(this._separator());
-        let resetArmed = false;
         const resetItem = new PopupMenu.PopupMenuItem('Reset today');
         resetItem.connect('activate', () => {
-            if (!resetArmed) {
-                resetArmed = true;
+            if (!this._resetArmed) {
+                this._resetArmed = true;
                 resetItem.label.text = 'Reset today — click again to confirm';
-                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
-                    resetArmed = false;
+                this._resetArmTimeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+                    if (!this._resetArmed)
+                        return GLib.SOURCE_REMOVE;
+                    this._resetArmed = false;
+                    this._resetArmTimeout = null;
                     resetItem.label.text = 'Reset today';
                     return GLib.SOURCE_REMOVE;
                 });
                 return;
             }
-            resetArmed = false;
+            this._resetArmed = false;
+            this._resetArmTimeout = null;
             resetItem.label.text = 'Reset today';
             this._resetToday();
         });
@@ -252,6 +261,14 @@ class AgentUsageButton extends PanelMenu.Button {
         const refreshItem = new PopupMenu.PopupMenuItem('Refresh');
         refreshItem.connect('activate', () => this._refresh());
         this._content.addMenuItem(refreshItem);
+    }
+
+    _clearResetArm() {
+        if (this._resetArmTimeout !== null) {
+            GLib.source_remove(this._resetArmTimeout);
+            this._resetArmTimeout = null;
+        }
+        this._resetArmed = false;
     }
 }
 
@@ -274,6 +291,7 @@ export default class AgentUsageExtension extends Extension {
             this._timer = null;
         }
         if (this._button !== null) {
+            this._button._clearResetArm();
             // The menu actor lives in Main.uiGroup, not in the button —
             // destroying only the button would leak it on every reload.
             this._button.menu?.destroy();

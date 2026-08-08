@@ -83,6 +83,16 @@ def _to_float(value, default=0.0):
         return default
 
 
+def _to_int(value, default=0):
+    """Coerce a value to int, tolerating strings and missing values."""
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _ts_ms(value, fallback_ms=None):
     """Normalize a timestamp (ms, seconds, or ISO-8601 string) to ms."""
     if value is None:
@@ -113,6 +123,10 @@ def _load_cache():
 
 def _save_cache(cache):
     try:
+        cutoff = (time.time() - SCAN_WINDOW_DAYS * 86400) * 1000
+        for value in cache.values():
+            if isinstance(value, dict):
+                _prune_cache_entries(value, cutoff)
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         tmp = CACHE_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -126,6 +140,7 @@ def _prune_cache_entries(entries, cutoff_ms):
     stale = [
         path for path, entry in entries.items()
         if (entry.get("m") or 0) // 1_000_000 < cutoff_ms
+        or not os.path.exists(path)
     ]
     for path in stale:
         del entries[path]
@@ -143,14 +158,16 @@ def _load_state():
 
 
 def _write_state(reset_ts_ms):
+    """Store the reset baseline. Returns True on success."""
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"reset_ts_ms": reset_ts_ms}, f)
         os.replace(tmp, STATE_FILE)
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        return False
 
 
 # ---------------------------------------------------------------- sources
@@ -221,10 +238,10 @@ def _claude_file_rows(path, mtime_ms):
                 "source": "claude",
                 "ts": _ts_ms(ev.get("timestamp"), mtime_ms),
                 "cost": _to_float(cost),
-                "tin": usage.get("input_tokens", 0),
-                "tout": usage.get("output_tokens", 0),
-                "tcache": usage.get("cache_read_input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0),
+                "tin": _to_int(usage.get("input_tokens")),
+                "tout": _to_int(usage.get("output_tokens")),
+                "tcache": _to_int(usage.get("cache_read_input_tokens"))
+                + _to_int(usage.get("cache_creation_input_tokens")),
                 "model": message.get("model") or "claude",
             })
     return rows
@@ -249,13 +266,13 @@ def _codex_file_rows(path, mtime_ms):
                 #  {"info":{"model":...,"input_tokens":N,"output_tokens":N,
                 #   "cache_read_input_tokens":N},"total":{...}}})
                 info = (ev.get("payload") or {}).get("info") or {}
-                tin = info.get("input_tokens", 0)
-                tout = info.get("output_tokens", 0) \
-                    + info.get("reasoning_output_tokens", 0)
+                tin = _to_int(info.get("input_tokens"))
+                tout = _to_int(info.get("output_tokens")) \
+                    + _to_int(info.get("reasoning_output_tokens"))
                 if tin == 0 and tout == 0:
                     continue
-                tcache = info.get("cache_read_input_tokens", 0) \
-                    or info.get("cached_input_tokens", 0)
+                tcache = _to_int(info.get("cache_read_input_tokens")) \
+                    or _to_int(info.get("cached_input_tokens"))
                 model = info.get("model") or info.get("model_name") or "unknown"
             elif event_type == "message":
                 # Legacy format: usage on the assistant message
@@ -264,11 +281,11 @@ def _codex_file_rows(path, mtime_ms):
                 usage = (ev.get("message") or {}).get("usage")
                 if not usage:
                     continue
-                tin = usage.get("prompt_tokens", 0)
-                tout = usage.get("completion_tokens", 0)
+                tin = _to_int(usage.get("prompt_tokens"))
+                tout = _to_int(usage.get("completion_tokens"))
                 if tin == 0 and tout == 0:
                     continue
-                tcache = usage.get("cache_read_input_tokens", 0)
+                tcache = _to_int(usage.get("cache_read_input_tokens"))
                 model = usage.get("model") \
                     or (ev.get("message") or {}).get("model") or "unknown"
             else:
@@ -321,7 +338,6 @@ def _scan_jsonl_dir(root, cache_key, parser):
         rows.extend(file_rows)
     if changed:
         entries.update(changed)
-        _prune_cache_entries(entries, cutoff)
         _save_cache(cache)
     return rows, errors
 
@@ -466,7 +482,9 @@ def main():
                 result["errors"].append({"source": name, "error": f"{type(e).__name__}: {e}"})
 
         if reset:
-            _write_state(int(time.time() * 1000))
+            if not _write_state(int(time.time() * 1000)):
+                result["errors"].append(
+                    {"source": "state", "error": f"cannot write {STATE_FILE}"})
         baseline = _load_state()
 
         agg = aggregate(rows, baseline)
