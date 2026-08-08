@@ -149,7 +149,7 @@ class AgentUsageButton extends PanelMenu.Button {
             ? formatMoney(today.cost)
             : today.tokens > 0
                 ? `${formatTokens(today.tokens)} tok`
-                : 'no usage';
+                : formatMoney(0);
 
         this.tooltip_text =
             `Today ${formatMoney(today.cost)} · ${formatTokens(today.tokens)} tok\n` +

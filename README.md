@@ -20,7 +20,7 @@ Agents with no data on your machine are simply skipped. Each source is read
 ## Features
 
 - **Panel indicator** showing today's cost (e.g. `$0.42`), token count for free
-  models, or `no usage` when there is none
+  models, or `$0.00` when there is no usage
 - **Hover tooltip** with today / 7 days / month summary
 - **Dropdown menu** with today / last 7 days / this month / all-time totals
 - **Reset today**: press **Reset today** (two-step confirm) and the today
@@ -94,7 +94,7 @@ you must **log out and log back in** (or use the GNOME on Xorg session, where
 ## Usage
 
 - The panel button shows today's total: `$0.42` when there's a cost, `42K tok`
-  when the models used today are free, `no usage` when nothing is recorded.
+  when the models used today are free, `$0.00` when nothing is recorded.
 - Hovering shows today / 7 days / month in a tooltip.
 - Click it for the full breakdown: today, 7 days, month, all time, per-model,
   per-source, last-7-days history, and a manual refresh item.
