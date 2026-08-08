@@ -37,6 +37,10 @@ EOF
     exit 1
 fi
 
+# Journal cursor at reload time: only errors logged AFTER the reload count.
+CURSOR=$(journalctl --user -n 0 --show-cursor -o cat 2>/dev/null \
+    | grep -oP '(?<=-- cursor: ).*' | tail -1 || true)
+
 gdbus call --session \
     --dest org.gnome.Shell \
     --object-path /org/gnome/Shell \
@@ -47,7 +51,13 @@ echo "reloaded $UUID"
 
 sleep 1
 
-ERRORS=$(journalctl --since '5 seconds ago' -o cat 2>/dev/null | grep "agent-usage" || true)
+if [ -n "$CURSOR" ]; then
+    ERRORS=$(journalctl --user --after-cursor "$CURSOR" -o cat 2>/dev/null \
+        | grep "agent-usage" || true)
+else
+    ERRORS=$(journalctl --user --since '5 seconds ago' -o cat 2>/dev/null \
+        | grep "agent-usage" || true)
+fi
 if [ -n "$ERRORS" ]; then
     echo "errors in the shell log:"
     echo "$ERRORS"
